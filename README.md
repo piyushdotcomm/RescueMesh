@@ -42,8 +42,8 @@ RescueMesh turns every phone into an offline AI survival node. Gemma 4 provides 
 ## Build & Run
 
 ```bash
-git clone https://github.com/RescueMeshTeam/rescuemesh.git
-cd rescuemesh
+git clone https://github.com/piyushdotcomm/RescueMesh.git
+cd RescueMesh
 flutter pub get
 flutter run
 ```

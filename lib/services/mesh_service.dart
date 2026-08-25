@@ -78,7 +78,20 @@ class MeshService extends ChangeNotifier {
       _deviceName = p.getString('mesh_device_name') ?? 'RescueMesh User';
       final r = p.getString('mesh_device_role') ?? MeshRole.survivor.name;
       _myRole = MeshRole.values.byName(r);
-      _deviceId = 'N_${Random().nextInt(9999)}';
+      // Reuse the identity across launches. A fresh random ID per launch
+      // made this device look brand-new to peers after every restart,
+      // orphaning its Ghost Protocol records and relay-store entries, and
+      // the 1-in-10000 random space risked two devices colliding on the
+      // same ID (which breaks presence dedup for both). Timestamp entropy
+      // keeps first-run collisions practically impossible.
+      final saved = p.getString('mesh_device_id');
+      if (saved != null && saved.isNotEmpty) {
+        _deviceId = saved;
+      } else {
+        _deviceId =
+            'N${DateTime.now().millisecondsSinceEpoch.toRadixString(36)}_${Random().nextInt(9999)}';
+        await p.setString('mesh_device_id', _deviceId);
+      }
     } catch (_) {}
   }
 
@@ -480,29 +493,40 @@ class MeshService extends ChangeNotifier {
   }
 
   void _startSOSFlash() {
-    int step = 0;
-    // Morse SOS: ... --- ... short=200ms long=500ms gap=400ms char-gap=1200ms
-    // Pattern: S(dot dot dot) O(dash dash dash) S(dot dot dot)
+    // Morse SOS ... --- ... as alternating ON/OFF durations in ms.
+    // Even indices = ON (dot 200ms, dash 500ms), odd indices = OFF gap
+    // (intra-letter 400ms, letter 800ms, word 1200ms before repeating).
     const pattern = [
-      200, 400, 200, 400, 200, // S: ... (3 shorts)
-      800,                      // letter gap  
-      500, 400, 500, 400, 500, // O: --- (3 longs)
-      800,                      // letter gap
-      200, 400, 200, 400, 200, // S: ... (3 shorts)
-      1200,                     // word gap
+      200, 400, 200, 400, 200, // S: · · ·
+      800,                     // letter gap
+      500, 400, 500, 400, 500, // O: — — —
+      800,                     // letter gap
+      200, 400, 200, 400, 200, // S: · · ·
+      1200,                    // word gap, then repeat
     ];
-    
-    _setFlash(true);
-    int idx = 0;
-    _flashlightTimer = Timer.periodic(const Duration(milliseconds: 1), (t) {
-      if (!_flashlightActive) { t.cancel(); _setFlash(false); return; }
-      final on = idx % 2 == 0;
+
+    // Chain one-shot timers instead of a 1ms periodic tick: each phase runs
+    // for its actual pattern duration. A 1ms periodic timer ignores the
+    // durations entirely and strobes at ~500Hz — invisible as Morse code,
+    // while hammering the flashlight method channel ~1000x/sec.
+    var idx = 0;
+
+    void runPhase() {
+      if (!_flashlightActive) {
+        _setFlash(false);
+        return;
+      }
+      final on = idx.isEven;
       _sosFlashOn = on;
       notifyListeners();
       _setFlash(on);
-      idx++;
-      if (idx >= pattern.length) idx = 0;
-    });
+      final durationMs = pattern[idx];
+      idx = (idx + 1) % pattern.length;
+      _flashlightTimer?.cancel();
+      _flashlightTimer = Timer(Duration(milliseconds: durationMs), runPhase);
+    }
+
+    runPhase();
   }
 
   // ─── PUBLIC ACTIONS ───────────────────────────────────────────
