@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/mesh_device.dart';
@@ -110,6 +111,7 @@ class MeshService extends ChangeNotifier {
       _cleanupTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkHealth());
       _digestTimer = Timer.periodic(const Duration(seconds: 5), (_) => _sendDigest());
       _ghostTimer = Timer.periodic(const Duration(seconds: 10), (_) => _purgeOldGhosts());
+      await _refreshBcastAddr();
       _broadcast();
       notifyListeners();
       return 'Mesh active';
@@ -139,6 +141,9 @@ class MeshService extends ChangeNotifier {
 
   void _broadcast() {
     if (!_meshActive || _socket == null) return;
+    // Keep the subnet target fresh (throttled inside) so joining a hotspot
+    // or LAN mid-session re-points broadcasts within one heartbeat.
+    unawaited(_refreshBcastAddr());
     final data = _encode({
       'type': 'p',
       'id': _deviceId,
@@ -155,7 +160,7 @@ class MeshService extends ChangeNotifier {
 
   void _send(List<int> p, {bool unicastPeers = false}) {
     // Always broadcast to common subnets
-    for (final a in [_bcast(), '255.255.255.255', '192.168.43.255', '192.168.137.255']) {
+    for (final a in [_bcastAddr, '255.255.255.255', '192.168.43.255', '192.168.137.255']) {
       try { _socket!.send(p, InternetAddress(a), _port); } catch (_) {}
     }
     // Also unicast to each known peer directly if requested
@@ -166,11 +171,52 @@ class MeshService extends ChangeNotifier {
     }
   }
 
-  String _bcast() {
-    final ip = _socket?.address.address ?? '';
-    final parts = ip.split('.');
-    if (parts.length == 4) return '${parts[0]}.${parts[1]}.${parts[2]}.255';
-    return '255.255.255.255';
+  /// Cached subnet-directed broadcast address (e.g. "192.168.43.255"),
+  /// resolved from live network interfaces — see [_refreshBcastAddr].
+  String _bcastAddr = '255.255.255.255';
+  DateTime _lastBcastResolve = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// RawDatagramSocket.bind(InternetAddress.anyIPv4) leaves socket.address
+  /// at 0.0.0.0, so deriving the broadcast target from the socket produced
+  /// "0.0.0.255" — an invalid destination whose send failed silently in the
+  /// catch-all. Discovery therefore depended entirely on the global
+  /// 255.255.255.255 send plus the two hardcoded hotspot addresses below.
+  /// Resolve the real interface IPv4 instead, preferring 192.168.x.x
+  /// (Android hotspot 192.168.43.x and typical home LANs), with any other
+  /// private subnet as fallback. Refreshed alongside the presence
+  /// heartbeat so a mid-session WiFi → hotspot switch picks up the new
+  /// subnet within seconds.
+  Future<void> _refreshBcastAddr() async {
+    final now = DateTime.now();
+    if (now.difference(_lastBcastResolve) < const Duration(seconds: 10)) {
+      return;
+    }
+    _lastBcastResolve = now;
+    try {
+      final ifaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      String? fallback;
+      for (final iface in ifaces) {
+        for (final addr in iface.addresses) {
+          final parts = addr.address.split('.');
+          if (parts.length != 4) continue;
+          // Skip link-local (169.254.x.x) and unspecified addresses.
+          if (addr.address.startsWith('169.254.') ||
+              addr.address.startsWith('0.')) {
+            continue;
+          }
+          final bcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
+          if (addr.address.startsWith('192.168.')) {
+            _bcastAddr = bcast;
+            return;
+          }
+          fallback ??= bcast;
+        }
+      }
+      if (fallback != null) _bcastAddr = fallback;
+    } catch (_) {}
   }
 
   List<int> _encode(Map<String, dynamic> d) => utf8.encode(jsonEncode(d));
@@ -243,9 +289,21 @@ class MeshService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Cap for the relay-dedupe set. Dart Sets preserve insertion order, so
+  /// `_seen.first` is the oldest id and can be evicted FIFO.
+  static const _maxSeenIds = 4000;
+
   void _purgeOldGhosts() {
     final cutoff = DateTime.now().subtract(const Duration(hours: 1));
     _ghosts.removeWhere((g) => g.goneSilentAt!.isBefore(cutoff));
+    // Age-prune the relay store — previously it grew for the whole session
+    // (only deactivateMesh cleared it), leaking memory on long-running
+    // meshes. Entries older than an hour are dead weight: digests only
+    // advertise the first 100 ids anyway.
+    _relayStore.removeWhere((_, m) => m.timestamp.isBefore(cutoff));
+    while (_seen.length > _maxSeenIds) {
+      _seen.remove(_seen.first);
+    }
   }
 
   // ─── SPECTRAL RELAY ───────────────────────────────────────────
@@ -300,7 +358,7 @@ class MeshService extends ChangeNotifier {
       'messageId': msgId, 'msgType': msg.type.name, 'payload': msg.payload,
       'timestamp': msg.timestamp.toIso8601String(), 'ttl': ttl - 1, 'hops': (json['hops'] as int?)! + 1,
     });
-    for (final a in [_bcast(), '255.255.255.255']) {
+    for (final a in [_bcastAddr, '255.255.255.255']) {
       final addr = InternetAddress(a);
       if (addr.address != from.address) {
         try { _socket?.send(next, addr, _port); } catch (_) {}
@@ -370,7 +428,7 @@ class MeshService extends ChangeNotifier {
     final payload = j['payload'] as String? ?? 'EMERGENCY!';
     final name = _devices.where((d) => d.id == id).firstOrNull?.name ?? 'Device $id';
     final msg = MeshMessage(
-      id: 'sos_${DateTime.now().millisecondsSinceEpoch}',
+      id: _nextSosId(id),
       type: MeshMessageType.sos,
       payload: '$name: $payload', fromDeviceId: id, timestamp: DateTime.now(),
     );
@@ -507,16 +565,40 @@ class MeshService extends ChangeNotifier {
 
   // ─── PUBLIC ACTIONS ───────────────────────────────────────────
 
+  int _sosSeq = 0;
+
+  /// Collision-resistant SOS message id. The previous millisecond-only id
+  /// made two devices broadcasting near-simultaneously — with unsynced
+  /// clocks, likely — produce identical ids, after which the gossip dedupe
+  /// in [_seen] silently dropped one of the pair across the whole mesh.
+  /// Origin device id + per-session sequence disambiguates.
+  String _nextSosId(String originId) =>
+      'sos_${originId}_${DateTime.now().millisecondsSinceEpoch}_${++_sosSeq}';
+
   Future<void> sendSOS({required String message}) async {
     if (!_meshActive || _socket == null) return;
+    // Best-effort GPS on the beacon so responders see WHERE it came from
+    // even when this device was never seen via presence (the common case
+    // for a trapped survivor). Last-known fix only — resolving a fresh
+    // position must never delay an emergency send. Without a prior fix or
+    // without location permission the SOS still goes out, minus coords,
+    // and relays propagate them untouched since they're part of the payload.
+    var coordsSuffix = '';
+    try {
+      final pos = await Geolocator.getLastKnownPosition();
+      if (pos != null) {
+        coordsSuffix =
+            '\n📍 ${pos.latitude.toStringAsFixed(5)}, ${pos.longitude.toStringAsFixed(5)}';
+      }
+    } catch (_) {}
     final msg = MeshMessage(
-      id: 'sos_${DateTime.now().millisecondsSinceEpoch}',
+      id: _nextSosId(_deviceId),
       type: MeshMessageType.sos,
-      payload: '$deviceName: $message', fromDeviceId: _deviceId, timestamp: DateTime.now(),
+      payload: '$deviceName: $message$coordsSuffix', fromDeviceId: _deviceId, timestamp: DateTime.now(),
     );
     _relayStore[msg.id] = msg; _seen.add(msg.id); _relayCount = _relayStore.length;
     _addMessage(msg);
-    _send(_encode({'type': 'sos', 'id': _deviceId, 'payload': message}), unicastPeers: true);
+    _send(_encode({'type': 'sos', 'id': _deviceId, 'payload': '$message$coordsSuffix'}), unicastPeers: true);
   }
 
   Future<void> updateMyStatus(MeshStatus s) async {
